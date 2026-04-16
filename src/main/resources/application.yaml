@@ -1,0 +1,44 @@
+server:
+  port: 8080
+
+subtitle:
+  # Ruta a ffmpeg en tu sistema. En Linux/Mac: /usr/bin/ffmpeg, en Windows: C:/ffmpeg/bin/ffmpeg.exe
+  ffmpeg-path: C:\Users\Usuario\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-8.1-full_build\bin\ffmpeg.exe
+  ffprobe-path: C:\Users\Usuario\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-8.1-full_build\bin\ffmpeg.exe
+
+  # Directorio temporal para archivos intermedios
+  temp-dir: C:\temp\subtitle-service
+
+  # Tiempo máximo de procesamiento por video (minutos)
+  processing-timeout-minutes: 30
+
+whisper:
+  # Opción A: Whisper via API de OpenAI (requiere API key)
+  openai-api-key:
+  openai-api-url: https://api.openai.com/v1/audio/transcriptions
+  model: whisper-1
+
+  # Opción B: Whisper local (Python process)
+  # Requiere: pip install openai-whisper
+  use-local: false
+  local-python-path: python3
+  local-model-size: medium  # tiny, base, small, medium, large
+
+async:
+  core-pool-size: 2
+  max-pool-size: 4
+  queue-capacity: 10
+  thread-name-prefix: subtitle-async-
+
+spring:
+  mvc:
+    async:
+      request-timeout: 600000  # 10 minutos (en milisegundos)
+  servlet:
+    multipart:
+      max-file-size: 500MB
+      max-request-size: 500MB
+
+logging:
+  level:
+    com.subtitleservice: DEBUG
