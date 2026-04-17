@@ -53,7 +53,10 @@ public class FFmpegService {
                 assFile.getFileName(), outputVideo.getFileName());
 
         // En Windows, las rutas con '\' deben escaparse para el filtro ass=
+        // Obtenemos la ruta absoluta del archivo ASS
         String assPath = assFile.toAbsolutePath().toString();
+
+        // Validamos el sistema operativo
         if (System.getProperty("os.name").toLowerCase().contains("win")) {
             // FFmpeg en Windows requiere escaping especial en filtros
             assPath = assPath.replace("\\", "\\\\").replace(":", "\\:");
@@ -69,6 +72,8 @@ public class FFmpegService {
         // Filtro de video: ass= quema los subtítulos
         // fontsdir permite cargar fuentes personalizadas si las tienes
         command.add("-vf");
+
+        // Aca lo que se hace es agregar el filtro de quemado de subtítulos con el path del archivo ASS
         command.add(String.format("ass='%s'", assPath));
 
         // Video: re-encodear con H.264 (necesario para aplicar el filtro)
@@ -97,12 +102,15 @@ public class FFmpegService {
     // Ejecución de comandos
     // =========================================================================
     private void executeCommand(List<String> command, Consumer<String> progressLog) throws Exception {
-        ProcessBuilder pb = new ProcessBuilder(command);
+        ProcessBuilder pb = new ProcessBuilder(command); // Creamos una instancia de ProcessBuilder que representa el proceso
         pb.redirectErrorStream(true); // FFmpeg escribe su output en stderr
 
-        Process process = pb.start(); // Inicia el proceso
 
-        // Leer output de FFmpeg en hilo separado (evita deadlock)
+        // Java lanza un proceso nativo en tu computadora. A partir de ese milisegundo, FFmpeg cobra vida, va a tu disco duro,
+        // busca el archivo .ass usando la ruta que le pasaste, y empieza a dibujar los subtítulos
+        Process process = pb.start();
+
+        // Hilo de lectura para evitar bloqueos del buffer del SO
         Thread outputReader = new Thread(() -> {
             try (BufferedReader reader = new BufferedReader(
                     new InputStreamReader(process.getInputStream()))) {
@@ -110,7 +118,7 @@ public class FFmpegService {
                 while ((line = reader.readLine()) != null) {
                     log.debug("[FFmpeg] {}", line);
 
-                    // FFmpeg reporta progreso con "frame=", "time=", "bitrate="
+                    // FFmpeg reporta progreso
                     if (progressLog != null && line.startsWith("frame=")) {
                         progressLog.accept(line);
                     }
@@ -120,21 +128,39 @@ public class FFmpegService {
             }
         });
 
-        // Inicia el hilo de lectura del output
         outputReader.start();
 
-        // Espera a que el proceso termine o exceda el timeout
-        boolean finished = process.waitFor(timeoutMinutes, TimeUnit.MINUTES);
-        outputReader.join(5000);
+        try {
+            // Espera a que el proceso termine o exceda el timeout
+            boolean finished = process.waitFor(timeoutMinutes, TimeUnit.MINUTES);
 
-        if (!finished) {
+            // Le damos unos segundos al lector para terminar de imprimir los últimos logs
+            outputReader.join(5000);
+
+            if (!finished) {
+                // [OPTIMIZACIÓN 3] Matar el proceso si supera el tiempo máximo
+                process.destroyForcibly();
+                throw new RuntimeException("FFmpeg excedió el timeout de " + timeoutMinutes + " minutos. Proceso destruido.");
+            }
+
+            int exitCode = process.exitValue();
+            if (exitCode != 0) {
+                throw new RuntimeException("FFmpeg falló con código de salida: " + exitCode);
+            }
+
+        } catch (InterruptedException e) {
+            // [OPTIMIZACIÓN CRÍTICA] Si el hilo de Spring es cancelado/interrumpido,
+            // aseguramos que el proceso nativo de FFmpeg muera y libere la CPU.
+            log.error("El hilo de ejecución fue interrumpido. Forzando el cierre de FFmpeg...");
             process.destroyForcibly();
-            throw new RuntimeException("FFmpeg excedió el timeout de " + timeoutMinutes + " minutos");
-        }
 
-        int exitCode = process.exitValue();
-        if (exitCode != 0) {
-            throw new RuntimeException("FFmpeg falló con código de salida: " + exitCode);
+            // Detenemos el hilo de lectura
+            outputReader.interrupt();
+
+            // Restauramos el estado de interrupción del hilo actual
+            Thread.currentThread().interrupt();
+
+            throw new RuntimeException("La ejecución de FFmpeg fue interrumpida abruptamente", e);
         }
     }
 }

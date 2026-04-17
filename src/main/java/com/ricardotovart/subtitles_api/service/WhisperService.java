@@ -19,6 +19,7 @@ import org.springframework.web.reactive.function.client.WebClient;
 
 import java.io.*;
 import java.lang.reflect.Array;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -90,29 +91,30 @@ public class WhisperService {
         // Para archivos > 25MB, extraer solo el audio (mucho más pequeño)
         Path audioFile = mediaFile;
         boolean audioExtracted = false;
+        String fileName = mediaFile.getFileName().toString().toLowerCase();
 
-        // Valida si el archivo es mayor a 24MB
-        if (mediaFile.toFile().length() > 24 * 1024 * 1024L) {
-            System.out.println("El archivo es menor ");
-            log.info("Archivo grande ({}MB), extrayendo audio...",
-                    mediaFile.toFile().length() / 1024 / 1024);
+        // Si NO es un archivo de audio puro, extraemos el audio SIEMPRE, sin importar el peso
+        if (!fileName.endsWith(".mp3") && !fileName.endsWith(".wav") && !fileName.endsWith(".m4a")) {
+            log.info("Archivo multimedia detectado, extrayendo pista de audio para optimizar red...");
             audioFile = extractAudioForWhisper(mediaFile);
             audioExtracted = true;
         }
 
+
         try {
-            // Crea el body de la petición de tipo multipart
             MultipartBodyBuilder bodyBuilder = new MultipartBodyBuilder();
             bodyBuilder.part("file", new FileSystemResource(audioFile.toFile()));
             bodyBuilder.part("model", model);
-            bodyBuilder.part("response_format", "verbose_json");  // Para obtener timestamps
-            bodyBuilder.part("timestamp_granularities[]", "word"); // Timestamps por palabra
+            bodyBuilder.part("response_format", "verbose_json");
+            bodyBuilder.part("timestamp_granularities[]", "word");
+
+            String whisperPrompt = "Este es un video para redes sociales. Usa puntuación correcta, mayúsculas al inicio. Jerga común: TikTok, Instagram, YouTube, influencer, vlog.";
+            bodyBuilder.part("prompt", whisperPrompt);
 
             if (language != null && !language.isBlank()) {
                 bodyBuilder.part("language", language);
             }
 
-            // Crea el body de la petición
             MultiValueMap<String, HttpEntity<?>> body = bodyBuilder.build();
 
             String response = webClient.post()
@@ -124,12 +126,12 @@ public class WhisperService {
                     .bodyToMono(String.class)
                     .timeout(Duration.ofMinutes(10))
                     .block();
-            System.out.println("Respuesta de Whisper API: " + response);
+
             return parseWhisperVerboseJson(response);
 
         } finally {
             if (audioExtracted) {
-                audioFile.toFile().delete();
+                Files.deleteIfExists(audioFile);
                 log.debug("Audio temporal eliminado: {}", audioFile);
             }
         }

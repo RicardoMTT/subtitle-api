@@ -12,7 +12,7 @@ public class SubtitleConfig {
     // ─── Tipografía ───────────────────────────────────────────────────────────
 
     /** Fuente de los subtítulos. Arial funciona en la mayoría de sistemas. */
-    private String fontName = "Arial";
+    private String fontName = "The Bold Font";
 
     /** Tamaño de fuente. 72 es ideal para videos verticales (9:16). Para 16:9 usar 56-64. */
     private int fontSize = 72;

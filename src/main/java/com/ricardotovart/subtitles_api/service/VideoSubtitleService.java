@@ -1,5 +1,6 @@
 package com.ricardotovart.subtitles_api.service;
 
+import com.ricardotovart.subtitles_api.model.JobStatus;
 import com.ricardotovart.subtitles_api.model.SubtitleConfig;
 import com.ricardotovart.subtitles_api.model.TimedWord;
 import org.slf4j.Logger;
@@ -8,12 +9,13 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 
+import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.List;
-import java.util.UUID;
-import java.util.concurrent.CompletableFuture;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Orquestador del pipeline completo:
@@ -29,6 +31,9 @@ import java.util.concurrent.CompletableFuture;
  */
 @Service
 public class VideoSubtitleService {
+
+    // Almacenamiento en caché local (hilo-seguro)
+    private final Map<String, JobStatus> jobCache = new ConcurrentHashMap<>();
 
     private static final Logger log = LoggerFactory.getLogger(VideoSubtitleService.class);
 
@@ -47,80 +52,82 @@ public class VideoSubtitleService {
         this.ffmpegService = ffmpegService;
     }
 
-    // =========================================================================
-    // Pipeline principal (Async)
-    // =========================================================================
 
     /**
-     * Procesa un video de forma asíncrona: transcribe + genera ASS + quema subtítulos.
-     *
-     * @param inputVideo ruta al video original
-     * @param language   idioma para Whisper ("es", "en", null = auto)
-     * @param config     configuración de estilo de subtítulos
-     * @return future con la ruta al video procesado
+     * Consulta el estado de un trabajo.
+     */
+    public JobStatus getJobStatus(String jobId) {
+        return jobCache.get(jobId);
+    }
+
+    /**
+     * Proceso principal asíncrono (No bloquea al Controller).
+     * Este @Async es el que hace que el método se ejecute en un hilo separado.
+     * El valor subtitleTaskExecutor es el nombre del executor de hilos configurado en AsyncConfig.
      */
     @Async("subtitleTaskExecutor")
-    public CompletableFuture<Path> processVideo(Path inputVideo, String language, SubtitleConfig config) {
+    public void processVideoAsync(String jobId, Path inputVideo, String language, SubtitleConfig config, String originalFilename) {
+        log.info("[Job {}] Iniciando procesamiento asíncrono: {}", jobId, originalFilename);
 
-        String jobId = UUID.randomUUID().toString().substring(0, 8);
-        log.info("[Job {}] Iniciando procesamiento: {}", jobId, inputVideo.getFileName());
+        // Todo este bloque de código (Whisper, ASS, FFmpeg)
+        // no correrá en el hilo principal de Tomcat,
+        // sino en uno de los 4 a 8 hilos que configuraste en tu AsyncConfig.
 
+
+        // Registrar el estado inicial
+        jobCache.put(jobId, JobStatus.processing(jobId));
         Path tempDir = null;
+
         try {
-            // Crear directorio temporal para este job
             tempDir = createTempDir(jobId);
 
-            // ── Paso 1: Transcripción con Whisper ──────────────────────────
-            log.info("[Job {}] Paso 1/3: Transcribiendo audio con Whisper...", jobId);
-
+            // ── Paso 1: Transcripción con Whisper
+            log.info("[Job {}] Paso 1/3: Transcribiendo audio...", jobId);
             List<TimedWord> words = whisperService.transcribe(inputVideo, language);
-
-            log.info("[Job {}] Transcripción completada: {} palabras ",jobId, words.size() );
 
             if (words.isEmpty()) {
                 throw new RuntimeException("Whisper no detectó palabras en el audio");
             }
 
-            // ── Paso 2: Generar archivo ASS ────────────────────────────────
-            // Este archivo será el que se usará para quemar los subtítulos
+            // ── Paso 2: Generar archivo ASS
             log.info("[Job {}] Paso 2/3: Generando subtítulos ASS...", jobId);
-
-            // ─── Generar ASS ───────────────────────────────────────────────
-            // Este ASS contendrá los subtítulos para quemar en el video, los subtitulos con animación
             Path assFile = tempDir.resolve("subtitles.ass");
-
             assGeneratorService.generateAssFile(words, config, assFile);
 
-            log.info("[Job {}] ASS generado ", jobId);
-
-                // ── Paso 3: Quemar subtítulos con FFmpeg ───────────────────────
+            // ── Paso 3: Quemar subtítulos con FFmpeg
             log.info("[Job {}] Paso 3/3: Quemando subtítulos en video...", jobId);
-
-            Path outputVideo = tempDir.resolve("output_" + inputVideo.getFileName()); // Se creara una variable que guardara el video final
+            Path outputVideo = tempDir.resolve("output_" + inputVideo.getFileName().toString());
 
             ffmpegService.burnSubtitles(inputVideo, assFile, outputVideo,
-                    progress -> log.debug("[Job {}] FFmpeg: {}", jobId, progress));
+                    progress -> log.debug("[Job {}] FFmpeg progreso: {}", jobId, progress));
 
+            log.info("[Job {}] Procesamiento exitoso. Archivo listo en: {}", jobId, outputVideo);
 
-            log.info("[outputVideo {}] Video",
-                    outputVideo);
-            return CompletableFuture.completedFuture(outputVideo);
+            // Actualizar caché a COMPLETADO
+            jobCache.put(jobId, JobStatus.completed(jobId, outputVideo));
 
         } catch (Exception e) {
-            log.error("[Job {}] Error en el procesamiento: {}", jobId, e.getMessage(), e);
-//            cleanup(tempDir);
-            return CompletableFuture.failedFuture(e);
+            log.error("[Job {}] Error crítico en el procesamiento: {}", jobId, e.getMessage(), e);
+            // Actualizar caché a FALLIDO
+            jobCache.put(jobId, JobStatus.failed(jobId, e.getMessage()));
+        } finally {
+            // Limpieza: Borramos el video original de entrada para no llenar el disco,
+            // ya que ya lo usamos. (NO borramos el outputVideo aún, el usuario debe descargarlo)
+            try {
+                Files.deleteIfExists(inputVideo);
+            } catch (IOException ignored) {
+                log.warn("[Job {}] No se pudo eliminar el archivo temporal de entrada", jobId);
+            }
         }
     }
-    // =========================================================================
-    // Utilitarios
-    // =========================================================================
 
     private Path createTempDir(String jobId) throws Exception {
         Path base = Paths.get(tempDirPath);
         Files.createDirectories(base);
         Path jobDir = base.resolve(jobId);
-        Files.createDirectory(jobDir);
+        if (!Files.exists(jobDir)) {
+            Files.createDirectory(jobDir);
+        }
         return jobDir;
     }
 

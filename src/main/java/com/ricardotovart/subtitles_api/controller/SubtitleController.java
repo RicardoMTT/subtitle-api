@@ -1,5 +1,6 @@
 package com.ricardotovart.subtitles_api.controller;
 
+import com.ricardotovart.subtitles_api.model.JobStatus;
 import com.ricardotovart.subtitles_api.model.SubtitleConfig;
 import com.ricardotovart.subtitles_api.service.VideoSubtitleService;
 import org.slf4j.Logger;
@@ -7,6 +8,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.core.io.FileSystemResource;
 import org.springframework.core.io.Resource;
 import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
@@ -15,6 +17,8 @@ import org.springframework.web.multipart.MultipartFile;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 
 /**
@@ -36,7 +40,7 @@ public class SubtitleController {
      * Endpoint principal: recibe video MP4, transcribe con Whisper, agrega subtítulos.
      */
     @PostMapping(value = "/process", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
-    public CompletableFuture<ResponseEntity<Resource>> processVideo(
+    public ResponseEntity<Map<String, String>> processVideo(
             @RequestPart("video") MultipartFile videoFile,
             @RequestParam(value = "language", defaultValue = "es") String language,
             @RequestParam(value = "wordsPerLine", defaultValue = "4") int wordsPerLine,
@@ -47,21 +51,26 @@ public class SubtitleController {
             @RequestParam(value = "playResX", defaultValue = "1080") int playResX,
             @RequestParam(value = "playResY", defaultValue = "1920") int playResY,
             @RequestParam(value = "backgroundMode", defaultValue = "none") String backgroundMode,
-            @RequestParam(value = "backgroundColor", defaultValue = "&H00000000") String backgroundColor
+            @RequestParam(value = "backgroundColor", defaultValue = "&H00000000") String backgroundColor,
+
+            // ¡NUEVOS PARÁMETROS AGREGADOS AQUÍ!
+            @RequestParam(value = "fontName", defaultValue = "The Bold Font") String fontName,
+            @RequestParam(value = "appearMode", defaultValue = "line") String appearMode
     ) {
         log.info("Recibida solicitud: archivo={}, tamaño={}MB, idioma={}",
                 videoFile.getOriginalFilename(),
                 videoFile.getSize() / 1024 / 1024,
                 language);
 
-        Path tempInput = null;
+        String jobId = UUID.randomUUID().toString().substring(0, 8);
+
         try {
-            // Guardar video que subiste en el archivo temporal tempInput
-            tempInput = Files.createTempFile("input_", "_" + videoFile.getOriginalFilename() );
+            Path tempInput = Files.createTempFile("input_", "_" + videoFile.getOriginalFilename());
             videoFile.transferTo(tempInput);
 
-            // Construir configuración necesaria para el procesamiento, estas configuraciones se agregan al video
+            // Agregamos los nuevos parámetros al builder
             SubtitleConfig config = SubtitleConfig.builder()
+                    .appearMode(appearMode)     // <-- Inyecta el modo (line o word)
                     .fontSize(fontSize)
                     .wordsPerLine(wordsPerLine)
                     .highlightFirstWord(highlightFirstWord)
@@ -72,98 +81,58 @@ public class SubtitleController {
                     .backgroundColor(backgroundColor)
                     .build();
 
-            // Guardar video que subiste en el archivo temporal tempInput en la variable finalTempInput
-            final Path finalTempInput = tempInput;
+            // Lanza el proceso en background
+            videoSubtitleService.processVideoAsync(jobId, tempInput, language, config, videoFile.getOriginalFilename());
 
-            System.out.println(
-                    "finalTempInput: " + finalTempInput.getFileName()
-            );
-
-
-            // Lanzar procesamiento asíncrono
-            return videoSubtitleService.processVideo(finalTempInput, language, config)
-                    .thenApply(outputPath -> buildFileResponse(outputPath, videoFile.getOriginalFilename()))
-                    .whenComplete((response, error) -> {
-                        System.out.println("error" + error);
-                        System.out.println("response" + response);
-                        System.out.println("finalTempInput: " + finalTempInput.getFileName());
-                        // Limpiar input temporal
-                        try { Files.deleteIfExists(finalTempInput); } catch (IOException ignored) {}
-
-                        if (error != null) {
-                            log.error("Error procesando video: {}", error.getMessage());
-                        }
-                    });
+            return ResponseEntity.accepted().body(Map.of(
+                    "jobId", jobId,
+                    "status", "PROCESSING",
+                    "message", "El video se está procesando. Consulta el estado usando el jobId."
+            ));
 
         } catch (IOException e) {
-            log.error("Error guardando video temporal", e);
-            return CompletableFuture.completedFuture(
-                    ResponseEntity.internalServerError().build());
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body(Map.of("error", "Error guardando el video original: " + e.getMessage()));
         }
     }
 
     /**
-     * Endpoint simplificado para uso rápido.
-     * Usa configuración por defecto para videos verticales de redes sociales.
+     * Endpoint para consultar el estado del procesamiento.
      */
-    @PostMapping(value = "/process-quick", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
-    public CompletableFuture<ResponseEntity<Resource>> processVideoQuick(
-            @RequestPart("video") MultipartFile videoFile,
-            @RequestParam(value = "language", defaultValue = "es") String language
-    ) {
-        // Config por defecto: optimizada para TikTok/Reels (1080x1920)
-        SubtitleConfig config = SubtitleConfig.builder()
-                .fontSize(72)
-                .wordsPerLine(4)
-                .highlightFirstWord(true)
-                .highlightColor("&H0000FFFF") // Amarillo: karaoke activo
-                .uppercase(true)
-                .playRes(1080, 1920)
-                .outlineWidth(4)
-                .marginBottom(100)
-                // Fondo negro sólido + karaoke amarillo (estilo de la imagen)
-                .backgroundMode("box")
-                .backgroundColor("&H00000000")
-                .build();
+    @GetMapping("/status/{jobId}")
+    public ResponseEntity<JobStatus> getJobStatus(@PathVariable String jobId) {
+        JobStatus status = videoSubtitleService.getJobStatus(jobId);
+        if (status == null) {
+            return ResponseEntity.notFound().build();
+        }
+        return ResponseEntity.ok(status);
+    }
+
+    /**
+     * Endpoint para descargar el video una vez completado.
+     */
+    @GetMapping("/download/{jobId}")
+    public ResponseEntity<Resource> downloadVideo(@PathVariable String jobId) {
+        JobStatus status = videoSubtitleService.getJobStatus(jobId);
+
+        if (status == null || !"COMPLETED".equals(status.status())) {
+            return ResponseEntity.status(HttpStatus.BAD_REQUEST).build(); // O un 404
+        }
 
         try {
-            Path tempInput = Files.createTempFile("input_quick_", ".mp4");
-            videoFile.transferTo(tempInput);
+            Path videoPath = status.outputPath();
+            Resource resource = new FileSystemResource(videoPath.toFile());
 
-            return videoSubtitleService.processVideo(tempInput, language, config)
-                    .thenApply(out -> buildFileResponse(out, videoFile.getOriginalFilename()))
-                    .whenComplete((r, e) -> {
-                        try { Files.deleteIfExists(tempInput); } catch (IOException ignored) {}
-                    });
+            return ResponseEntity.ok()
+                    .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"subtitulado_" + videoPath.getFileName().toString() + "\"")
+                    .contentType(MediaType.parseMediaType("video/mp4"))
+                    .contentLength(resource.contentLength())
+                    .body(resource);
 
         } catch (IOException e) {
-            return CompletableFuture.completedFuture(
-                    ResponseEntity.internalServerError().build());
+            return ResponseEntity.internalServerError().build();
         }
     }
 
-    // =========================================================================
-    // Health check
-    // =========================================================================
 
-    @GetMapping("/health")
-    public ResponseEntity<String> health() {
-        return ResponseEntity.ok("Subtitle Service OK");
-    }
-
-    // =========================================================================
-    // Helpers
-    // =========================================================================
-
-    // Metodo privado usado para construir la respuesta de un archivo
-    private ResponseEntity<Resource> buildFileResponse(Path outputPath, String originalName) {
-        Resource resource = new FileSystemResource(outputPath);
-
-        String outputFilename = "subtitled_" + (originalName != null ? originalName : "output.mp4");
-
-        return ResponseEntity.ok()
-                .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"" + outputFilename + "\"")
-                .contentType(MediaType.parseMediaType("video/mp4"))
-                .body(resource);
-    }
 }
